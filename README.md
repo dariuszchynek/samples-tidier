@@ -41,14 +41,14 @@ brew install pipx
 pipx install --python /opt/homebrew/bin/python3.11 "git+https://github.com/facebookresearch/demucs.git"
 ```
 
-Make scripts executable:
+Make scripts executable (use Your path to ytwav and wavbatch):
 
 ```bash
 chmod +x /Users/dariuszchynek/Documents/projekty/ytwav/ytwav
 chmod +x /Users/dariuszchynek/Documents/projekty/ytwav/wavbatch
 ```
 
-Optional global commands:
+Optional global commands (use Your path to ytwav and wavbatch):
 
 ```bash
 sudo ln -sf /Users/dariuszchynek/Documents/projekty/ytwav/ytwav /usr/local/bin/ytwav
