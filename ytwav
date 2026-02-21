@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+Usage: ytwav <youtube_url>
+
+Downloads audio from YouTube and saves it as WAV in ~/Downloads.
+Requires: yt-dlp, ffmpeg
+EOF
+  exit 0
+fi
+
+if ! command -v yt-dlp >/dev/null 2>&1; then
+  echo "Error: yt-dlp not found. Install with: brew install yt-dlp" >&2
+  exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Error: ffmpeg not found. Install with: brew install ffmpeg" >&2
+  exit 1
+fi
+
+url="$1"
+out_dir="${HOME}/Downloads"
+
+yt_out="$(
+  yt-dlp \
+    --no-progress \
+    --quiet \
+    -x \
+    --audio-format wav \
+    --audio-quality 0 \
+    -o "${out_dir}/%(title).200s.%(ext)s" \
+    --print after_move:filepath \
+    "${url}"
+)"
+
+downloaded_path="$(printf "%s\n" "${yt_out}" | tail -n 1 | tr -d '\r')"
+
+if [[ ! -f "${downloaded_path}" ]]; then
+  echo "Error: expected file not found: ${downloaded_path}" >&2
+  echo "yt-dlp output was:" >&2
+  printf "%s\n" "${yt_out}" >&2
+  exit 1
+fi
+
+echo "Saved: ${downloaded_path}"

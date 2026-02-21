@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+print_help() {
+  cat <<'EOF'
+Usage: wavbatch [directory]
+
+Scans a directory for WAV files, detects key, renames files to:
+  <KEY>-<BPM>bpm-<original_name>.wav
+Then extracts drum-focused segments and saves:
+  drums_<file_stem>_01.wav, drums_<file_stem>_02.wav, ...
+
+Defaults:
+  directory: current folder
+  input files: *.wav, excluding files starting with drums_
+
+Options:
+  --nodrums   skip drum-segment extraction
+
+Requires:
+  ffmpeg, ffprobe, aubio (aubiopitch, aubiotrack), demucs
+EOF
+}
+
+for cmd in ffmpeg ffprobe aubiopitch aubiotrack demucs; do
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    echo "Error: missing command '${cmd}'" >&2
+    exit 1
+  fi
+done
+
+target_dir="."
+target_dir_from_arg=0
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+skip_drums=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+    --nodrums)
+      skip_drums=1
+      shift
+      ;;
+    -*)
+      echo "Error: unknown option: $1" >&2
+      print_help >&2
+      exit 1
+      ;;
+    *)
+      if [[ "${target_dir_from_arg}" -eq 1 ]]; then
+        echo "Error: too many positional arguments" >&2
+        print_help >&2
+        exit 1
+      fi
+      target_dir="$1"
+      target_dir_from_arg=1
+      shift
+      ;;
+  esac
+done
+
+if [[ ! -d "${target_dir}" ]]; then
+  echo "Error: directory not found: ${target_dir}" >&2
+  exit 1
+fi
+
+detect_key() {
+  local input_path="$1"
+  local key
+
+  key="$(
+    aubiopitch -i "${input_path}" -u midi -T seconds -s -70 2>/dev/null | awk '
+      BEGIN {
+        maj[0]=6.35; maj[1]=2.23; maj[2]=3.48; maj[3]=2.33; maj[4]=4.38; maj[5]=4.09;
+        maj[6]=2.52; maj[7]=5.19; maj[8]=2.39; maj[9]=3.66; maj[10]=2.29; maj[11]=2.88;
+        min[0]=6.33; min[1]=2.68; min[2]=3.52; min[3]=5.38; min[4]=2.60; min[5]=3.53;
+        min[6]=2.54; min[7]=4.75; min[8]=3.98; min[9]=2.69; min[10]=3.34; min[11]=3.17;
+        names[0]="C"; names[1]="C#"; names[2]="D"; names[3]="D#"; names[4]="E"; names[5]="F";
+        names[6]="F#"; names[7]="G"; names[8]="G#"; names[9]="A"; names[10]="A#"; names[11]="B";
+      }
+      {
+        m = $2;
+        if (m == "" || m <= 0) next;
+        pc = int(m + 0.5) % 12;
+        if (pc < 0) pc += 12;
+        hist[pc] += 1;
+      }
+      END {
+        for (i = 0; i < 12; i++) total += hist[i];
+        if (total == 0) { print ""; exit 0; }
+        for (i = 0; i < 12; i++) hist[i] /= total;
+        bestScore = -1e9;
+        bestKey = -1;
+        bestMode = "";
+        for (root = 0; root < 12; root++) {
+          score = 0;
+          for (i = 0; i < 12; i++) {
+            idx = (i + root) % 12;
+            score += hist[i] * maj[idx];
+          }
+          if (score > bestScore) { bestScore = score; bestKey = root; bestMode = "major"; }
+          score = 0;
+          for (i = 0; i < 12; i++) {
+            idx = (i + root) % 12;
+            score += hist[i] * min[idx];
+          }
+          if (score > bestScore) { bestScore = score; bestKey = root; bestMode = "minor"; }
+        }
+        if (bestKey < 0) { print ""; exit 0; }
+        if (bestMode == "minor") printf "%sm\n", names[bestKey]; else printf "%s\n", names[bestKey];
+      }
+    '
+  )"
+
+  if [[ -z "${key}" ]]; then
+    key="UnknownKey"
+  fi
+  printf "%s\n" "${key}"
+}
+
+rename_with_key() {
+  local input_path="$1"
+  local key="$2"
+  local bpm="$3"
+  local dir base stripped candidate ts
+
+  dir="$(dirname "${input_path}")"
+  base="$(basename "${input_path}")"
+  stripped="$(printf "%s" "${base}" | sed -E 's/^[A-G](#|b)?m?-([0-9]{2,3}bpm-)?//')"
+  candidate="${dir}/${key}-${bpm}bpm-${stripped}"
+
+  if [[ "${candidate}" == "${input_path}" ]]; then
+    printf "%s\n" "${input_path}"
+    return
+  fi
+
+  if [[ -e "${candidate}" ]]; then
+    ts="$(date +%Y%m%d-%H%M%S)"
+    candidate="${dir}/${key}-${ts}-${stripped}"
+  fi
+
+  mv "${input_path}" "${candidate}"
+  printf "%s\n" "${candidate}"
+}
+
+detect_bpm() {
+  local input_path="$1"
+  local tmp_intervals median bpm
+
+  tmp_intervals="$(mktemp)"
+  aubiotrack -i "${input_path}" -T seconds -s -70 2>/dev/null | awk '
+    {
+      t = $1 + 0;
+      if (t <= 0) next;
+      if (prev > 0) {
+        d = t - prev;
+        if (d >= 0.20 && d <= 2.00) print d;
+      }
+      prev = t;
+    }
+  ' | sort -n > "${tmp_intervals}"
+
+  median="$(
+    awk '
+      { a[NR] = $1; }
+      END {
+        if (NR == 0) { print ""; exit 0; }
+        if (NR % 2 == 1) {
+          print a[(NR + 1) / 2];
+        } else {
+          print (a[NR / 2] + a[(NR / 2) + 1]) / 2;
+        }
+      }
+    ' "${tmp_intervals}"
+  )"
+  rm -f "${tmp_intervals}"
+
+  if [[ -z "${median}" ]]; then
+    echo "0"
+    return
+  fi
+
+  bpm="$(
+    awk -v m="${median}" 'BEGIN {
+      if (m <= 0) { print 0; exit 0; }
+      b = 60.0 / m;
+      while (b < 70.0) b *= 2.0;
+      while (b > 180.0) b /= 2.0;
+      printf "%d\n", int(b + 0.5);
+    }'
+  )"
+
+  if [[ -z "${bpm}" || "${bpm}" == "0" ]]; then
+    echo "0"
+  else
+    echo "${bpm}"
+  fi
+}
+
+file_size_bytes() {
+  local path="$1"
+  if stat -f%z "${path}" >/dev/null 2>&1; then
+    stat -f%z "${path}"
+    return
+  fi
+  stat -c%s "${path}"
+}
+
+extract_drums_segments() {
+  local input_path="$1"
+  local input_dir input_base input_stem
+  local tmp_dir segments_file segments_raw drums_active other_silence
+  local drums_rms_log other_rms_log drums_rms_sec other_rms_sec dominance_segments
+  local demucs_dir demucs_log drums_stem other_stem drums_duration
+  local drums_log other_log
+  local drums_db other_silence_db silence_min min_segment_len merge_gap segment_pad
+  local track_duration dom_min_segment segment_count seg_start seg_end
+  local padded_start padded_end seg_len out_file source_size out_size skipped_same_size
+
+  input_dir="$(dirname "${input_path}")"
+  input_base="$(basename "${input_path}")"
+  input_stem="${input_base%.wav}"
+  source_size="$(file_size_bytes "${input_path}" || true)"
+
+  drums_db="-48"
+  other_silence_db="-30"
+  silence_min="0.25"
+  min_segment_len="0.8"
+  merge_gap="0.9"
+  segment_pad="2.0"
+
+  tmp_dir="$(mktemp -d)"
+  segments_file="${tmp_dir}/segments.txt"
+  segments_raw="${tmp_dir}/segments_raw.txt"
+  drums_active="${tmp_dir}/drums_active.txt"
+  other_silence="${tmp_dir}/other_silence.txt"
+  drums_rms_log="${tmp_dir}/drums_rms.log"
+  other_rms_log="${tmp_dir}/other_rms.log"
+  drums_rms_sec="${tmp_dir}/drums_rms_sec.txt"
+  other_rms_sec="${tmp_dir}/other_rms_sec.txt"
+  dominance_segments="${tmp_dir}/dominance_segments.txt"
+  demucs_dir="${tmp_dir}/demucs_out"
+  demucs_log="${tmp_dir}/demucs.log"
+  drums_log="${tmp_dir}/drums_silence.log"
+  other_log="${tmp_dir}/other_silence.log"
+
+  echo "  Demucs: ${input_base}"
+  : > "${demucs_log}"
+  if ! PYTHONWARNINGS=ignore demucs --two-stems drums -n htdemucs --out "${demucs_dir}" "${input_path}" \
+      > >(tee -a "${demucs_log}") \
+      2> >(tee -a "${demucs_log}" >&2); then
+    echo "  Error: demucs failed for ${input_base}" >&2
+    tail -n 20 "${demucs_log}" >&2 || true
+    rm -rf "${tmp_dir}"
+    return 1
+  fi
+
+  drums_stem="$(find "${demucs_dir}" -type f -name 'drums.wav' | head -n 1 || true)"
+  other_stem="$(find "${demucs_dir}" -type f -name 'no_drums.wav' | head -n 1 || true)"
+  if [[ ! -f "${drums_stem}" || ! -f "${other_stem}" ]]; then
+    echo "  Error: demucs stems missing for ${input_base}" >&2
+    rm -rf "${tmp_dir}"
+    return 1
+  fi
+
+  drums_duration="$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "${drums_stem}" || true)"
+
+  ffmpeg -v error -i "${drums_stem}" -af "silencedetect=n=${drums_db}dB:d=${silence_min}" -f null - 2>"${drums_log}" || true
+  ffmpeg -v error -i "${other_stem}" -af "silencedetect=n=${other_silence_db}dB:d=${silence_min}" -f null - 2>"${other_log}" || true
+
+  # Adaptive thresholds from stems.
+  local drums_mean other_mean
+  drums_mean="$(ffmpeg -i "${drums_stem}" -af volumedetect -f null - 2>&1 | awk -F': ' '/mean_volume:/ {print $2}' | tail -n 1 | tr -d ' dB\r' || true)"
+  other_mean="$(ffmpeg -i "${other_stem}" -af volumedetect -f null - 2>&1 | awk -F': ' '/mean_volume:/ {print $2}' | tail -n 1 | tr -d ' dB\r' || true)"
+  if [[ "${drums_mean}" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    drums_db="$(awk -v m="${drums_mean}" 'BEGIN { t = m - 10.0; if (t < -50) t = -50; if (t > -24) t = -24; printf "%.1f", t; }')"
+  fi
+  if [[ "${other_mean}" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    other_silence_db="$(awk -v m="${other_mean}" 'BEGIN { t = m + 5.0; if (t < -38) t = -38; if (t > -18) t = -18; printf "%.1f", t; }')"
+  fi
+  ffmpeg -v error -i "${drums_stem}" -af "silencedetect=n=${drums_db}dB:d=${silence_min}" -f null - 2>"${drums_log}" || true
+  ffmpeg -v error -i "${other_stem}" -af "silencedetect=n=${other_silence_db}dB:d=${silence_min}" -f null - 2>"${other_log}" || true
+  echo "  Auto thresholds: drums=${drums_db}dB, other=${other_silence_db}dB"
+
+  awk -v duration="${drums_duration:-0}" '
+    function emit_segment(a, b, s, e, l) {
+      s = a + 0;
+      e = b + 0;
+      l = e - s;
+      if (l > 0.02) printf "%.3f %.3f\n", s, e;
+    }
+    BEGIN { prev = 0; }
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "silence_start:") {
+          s = $(i + 1) + 0;
+          if (s > prev) emit_segment(prev, s);
+        }
+        if ($i == "silence_end:") {
+          e = $(i + 1) + 0;
+          if (e > prev) prev = e;
+        }
+      }
+    }
+    END {
+      if (duration > prev) emit_segment(prev, duration);
+    }
+  ' "${drums_log}" > "${drums_active}"
+
+  awk '
+    function emit_segment(a, b, s, e, l) {
+      s = a + 0;
+      e = b + 0;
+      l = e - s;
+      if (l > 0.02) printf "%.3f %.3f\n", s, e;
+    }
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "silence_start:") {
+          start = $(i + 1) + 0;
+        }
+        if ($i == "silence_end:") {
+          end = $(i + 1) + 0;
+          if (end > start) emit_segment(start, end);
+        }
+      }
+    }
+  ' "${other_log}" > "${other_silence}"
+
+  awk -v min_len="${min_segment_len}" '
+    FNR == NR {
+      n++;
+      s[n] = $1 + 0;
+      e[n] = $2 + 0;
+      next;
+    }
+    {
+      ds = $1 + 0;
+      de = $2 + 0;
+      for (i = 1; i <= n; i++) {
+        x1 = (ds > s[i]) ? ds : s[i];
+        x2 = (de < e[i]) ? de : e[i];
+        if (x2 - x1 >= min_len) printf "%.3f %.3f\n", x1, x2;
+      }
+    }
+  ' "${other_silence}" "${drums_active}" > "${segments_raw}"
+
+  sort -n -k1,1 -k2,2 "${segments_raw}" | awk -v min_len="${min_segment_len}" -v gap="${merge_gap}" '
+    NR == 1 { cs = $1 + 0; ce = $2 + 0; next; }
+    {
+      s = $1 + 0; e = $2 + 0;
+      if (s <= ce + gap) {
+        if (e > ce) ce = e;
+        next;
+      }
+      if (ce - cs >= min_len) printf "%.3f %.3f\n", cs, ce;
+      cs = s; ce = e;
+    }
+    END {
+      if (NR > 0 && ce - cs >= min_len) printf "%.3f %.3f\n", cs, ce;
+    }
+  ' > "${segments_file}"
+
+  if [[ ! -s "${segments_file}" ]]; then
+    echo "  No intersection segments. Trying dominance fallback..."
+    dom_min_segment="$(awk -v m="${min_segment_len}" 'BEGIN { if (m < 2.0) m = 2.0; printf "%.3f", m; }')"
+
+    ffmpeg -hide_banner -nostats -v info -i "${drums_stem}" \
+      -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level" \
+      -f null - 2>"${drums_rms_log}" || true
+    ffmpeg -hide_banner -nostats -v info -i "${other_stem}" \
+      -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level" \
+      -f null - 2>"${other_rms_log}" || true
+
+    awk '
+      /pts_time:/ {
+        match($0, /pts_time:[[:space:]]*[-0-9.]+/);
+        if (RSTART > 0) {
+          token = substr($0, RSTART, RLENGTH);
+          split(token, a, ":");
+          cur_sec = int(a[2] + 0);
+        }
+        next;
+      }
+      /lavfi\.astats\.Overall\.RMS_level=/ {
+        split($0, b, "=");
+        raw = b[2];
+        gsub(/[[:space:]]+/, "", raw);
+        if (raw ~ /-inf/) val = -120; else val = raw + 0;
+        if (cur_sec >= 0) {
+          sum[cur_sec] += val;
+          cnt[cur_sec] += 1;
+        }
+      }
+      END {
+        for (s in cnt) printf "%d %.3f\n", s, (sum[s] / cnt[s]);
+      }
+    ' "${drums_rms_log}" | sort -n -k1,1 > "${drums_rms_sec}"
+
+    awk '
+      /pts_time:/ {
+        match($0, /pts_time:[[:space:]]*[-0-9.]+/);
+        if (RSTART > 0) {
+          token = substr($0, RSTART, RLENGTH);
+          split(token, a, ":");
+          cur_sec = int(a[2] + 0);
+        }
+        next;
+      }
+      /lavfi\.astats\.Overall\.RMS_level=/ {
+        split($0, b, "=");
+        raw = b[2];
+        gsub(/[[:space:]]+/, "", raw);
+        if (raw ~ /-inf/) val = -120; else val = raw + 0;
+        if (cur_sec >= 0) {
+          sum[cur_sec] += val;
+          cnt[cur_sec] += 1;
+        }
+      }
+      END {
+        for (s in cnt) printf "%d %.3f\n", s, (sum[s] / cnt[s]);
+      }
+    ' "${other_rms_log}" | sort -n -k1,1 > "${other_rms_sec}"
+
+    awk -v min_len="${dom_min_segment}" -v gap="${merge_gap}" -v min_drums="-52" -v margin="6.0" -v max_other="-28.0" '
+      FNR == NR {
+        d[$1] = $2;
+        if ($1 > maxs) maxs = $1;
+        next;
+      }
+      {
+        o[$1] = $2;
+        if ($1 > maxs) maxs = $1;
+      }
+      END {
+        run = -1;
+        for (s = 0; s <= maxs + 1; s++) {
+          dv = (s in d) ? d[s] : -120;
+          ov = (s in o) ? o[s] : -120;
+          ok = (dv >= min_drums && (dv - ov) >= margin && ov <= max_other);
+          if (ok && run < 0) run = s;
+          if (!ok && run >= 0) {
+            st = run + 0.0;
+            en = s + 0.0;
+            if (en - st >= min_len) {
+              if (n == 0) {
+                ns = st; ne = en; n = 1;
+              } else if (st <= ne + gap) {
+                if (en > ne) ne = en;
+              } else {
+                printf "%.3f %.3f\n", ns, ne;
+                ns = st; ne = en;
+              }
+            }
+            run = -1;
+          }
+        }
+        if (n == 1) printf "%.3f %.3f\n", ns, ne;
+      }
+    ' "${drums_rms_sec}" "${other_rms_sec}" > "${dominance_segments}"
+
+    if [[ -s "${dominance_segments}" ]]; then
+      cp "${dominance_segments}" "${segments_file}"
+      echo "  Using dominance fallback segments."
+    fi
+  fi
+
+  track_duration="$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "${input_path}" || echo 0)"
+  segment_count=0
+  skipped_same_size=0
+  while read -r seg_start seg_end; do
+    [[ -z "${seg_start:-}" || -z "${seg_end:-}" ]] && continue
+
+    padded_start="$(awk -v s="${seg_start}" -v p="${segment_pad}" 'BEGIN { v=s-p; if (v < 0) v=0; printf "%.3f", v }')"
+    padded_end="$(awk -v e="${seg_end}" -v p="${segment_pad}" -v d="${track_duration}" 'BEGIN { v=e+p; if (d > 0 && v > d) v=d; if (v < 0) v=0; printf "%.3f", v }')"
+    seg_len="$(awk -v a="${padded_start}" -v b="${padded_end}" 'BEGIN { v=b-a; if (v < 0) v=0; printf "%.3f", v }')"
+    if awk -v l="${seg_len}" 'BEGIN { exit (l <= 0 ? 0 : 1) }'; then
+      continue
+    fi
+
+    segment_count=$((segment_count + 1))
+    out_file="$(printf "%s/drums_%s_%02d.wav" "${input_dir}" "${input_stem}" "${segment_count}")"
+    if [[ -e "${out_file}" ]]; then
+      out_file="$(printf "%s/drums_%s_%02d_%s.wav" "${input_dir}" "${input_stem}" "${segment_count}" "$(date +%H%M%S)")"
+    fi
+    ffmpeg -y -v error -ss "${padded_start}" -t "${seg_len}" -i "${input_path}" -acodec pcm_s16le "${out_file}"
+    out_size="$(file_size_bytes "${out_file}" || true)"
+    if [[ -n "${source_size}" && -n "${out_size}" && "${out_size}" == "${source_size}" ]]; then
+      rm -f "${out_file}"
+      segment_count=$((segment_count - 1))
+      skipped_same_size=$((skipped_same_size + 1))
+      echo "  Skipped: $(basename "${out_file}") (same size as source, likely drums-only sample)"
+      continue
+    fi
+    echo "  Saved: $(basename "${out_file}") (${padded_start}s -> ${padded_end}s)"
+  done < "${segments_file}"
+
+  if (( segment_count == 0 )); then
+    if (( skipped_same_size > 0 )); then
+      echo "  No extra drums files saved: source appears to be drums-only."
+    else
+      echo "  No drum segments found."
+    fi
+  elif (( skipped_same_size > 0 )); then
+    echo "  Skipped identical drums files: ${skipped_same_size}"
+  fi
+
+  rm -rf "${tmp_dir}"
+  return 0
+}
+
+files=()
+while IFS= read -r -d '' f; do
+  files+=("$f")
+done < <(find "${target_dir}" -maxdepth 1 -type f \( -iname '*.wav' \) ! -iname 'drums_*' -print0)
+
+if (( ${#files[@]} == 0 )); then
+  # Convenience fallback: if run via absolute path from another cwd,
+  # also try the folder where this script lives.
+  if (( target_dir_from_arg == 0 )) && [[ "${script_dir}" != "$(cd "${target_dir}" && pwd)" ]]; then
+    while IFS= read -r -d '' f; do
+      files+=("$f")
+    done < <(find "${script_dir}" -maxdepth 1 -type f \( -iname '*.wav' \) ! -iname 'drums_*' -print0)
+    if (( ${#files[@]} > 0 )); then
+      target_dir="${script_dir}"
+      echo "No WAV files in current folder. Using script folder: ${target_dir}"
+    fi
+  fi
+fi
+
+if (( ${#files[@]} == 0 )); then
+  echo "No WAV files found in: ${target_dir}"
+  exit 0
+fi
+
+echo "Found ${#files[@]} WAV file(s) in ${target_dir}"
+ok_count=0
+err_count=0
+idx=0
+for file in "${files[@]}"; do
+  idx=$((idx + 1))
+  if [[ ! -f "${file}" ]]; then
+    continue
+  fi
+
+  echo ""
+  echo "[${idx}/${#files[@]}] Processing: $(basename "${file}")"
+  base_name="$(basename "${file}")"
+  key=""
+  if [[ "${base_name}" =~ ^drums_ ]]; then
+    key="UnknownKey"
+    echo "  Skip key detection: drums_ prefix."
+  elif [[ "${base_name}" =~ ^([A-G](#|b)?m?)- ]]; then
+    key="${BASH_REMATCH[1]}"
+    echo "  Skip key detection: key already in filename (${key})."
+  else
+    key="$(detect_key "${file}")"
+  fi
+  bpm="$(detect_bpm "${file}")"
+  if [[ "${bpm}" == "0" ]]; then
+    bpm="000"
+  fi
+  renamed_path="$(rename_with_key "${file}" "${key}" "${bpm}")"
+  if [[ "${renamed_path}" != "${file}" ]]; then
+    echo "  Renamed to: $(basename "${renamed_path}") (key=${key}, bpm~${bpm})"
+  else
+    echo "  Name unchanged. (key=${key}, bpm~${bpm})"
+  fi
+
+  if (( skip_drums == 1 )); then
+    echo "  Skipping drums extraction (--nodrums)."
+    ok_count=$((ok_count + 1))
+  else
+    if extract_drums_segments "${renamed_path}"; then
+      ok_count=$((ok_count + 1))
+    else
+      err_count=$((err_count + 1))
+    fi
+  fi
+done
+
+echo ""
+echo "Done. OK: ${ok_count}, Errors: ${err_count}"
