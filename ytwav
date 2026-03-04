@@ -24,17 +24,52 @@ fi
 url="$1"
 out_dir="${HOME}/Downloads"
 
-yt_out="$(
-  yt-dlp \
-    --no-progress \
-    --quiet \
-    -x \
-    --audio-format wav \
-    --audio-quality 0 \
-    -o "${out_dir}/%(title).200s.%(ext)s" \
-    --print after_move:filepath \
-    "${url}"
-)"
+yt_out=""
+download_ok=0
+
+for client in "web" "mweb" "ios" "android"; do
+  if yt_out="$(
+    yt-dlp \
+      --no-progress \
+      --quiet \
+      --no-warnings \
+      --extractor-args "youtube:player_client=${client}" \
+      -x \
+      --audio-format wav \
+      --audio-quality 0 \
+      -o "${out_dir}/%(title).200s.%(ext)s" \
+      --print after_move:filepath \
+      "${url}" 2>/dev/null
+  )"; then
+    download_ok=1
+    break
+  fi
+done
+
+if [[ "${download_ok}" -ne 1 ]]; then
+  # Last fallback without forcing player client.
+  if yt_out="$(
+    yt-dlp \
+      --no-progress \
+      --quiet \
+      --no-warnings \
+      -x \
+      --audio-format wav \
+      --audio-quality 0 \
+      -o "${out_dir}/%(title).200s.%(ext)s" \
+      --print after_move:filepath \
+      "${url}" 2>/dev/null
+  )"; then
+    download_ok=1
+  fi
+fi
+
+if [[ "${download_ok}" -ne 1 ]]; then
+  echo "Error: could not download audio for this video." >&2
+  echo "Tip: try updating yt-dlp: brew upgrade yt-dlp" >&2
+  echo "If still failing, test formats manually: yt-dlp -F \"${url}\"" >&2
+  exit 1
+fi
 
 downloaded_path="$(printf "%s\n" "${yt_out}" | tail -n 1 | tr -d '\r')"
 
